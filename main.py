@@ -1,4 +1,4 @@
-from bm25pt.bm25 import BM25
+from bm25pt import BM25
 
 if __name__ == "__main__":
     corpus = [

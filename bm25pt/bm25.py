@@ -1,6 +1,7 @@
-from typing import Any, Sequence
+from typing import Callable, Sequence
 
 import torch
+from tqdm import trange
 from transformers import AutoTokenizer
 
 
@@ -13,17 +14,23 @@ def get_device(device_id: int | None = None) -> torch.device:
     return torch.device(device_name)
 
 
-def generate_batch(data: Sequence[Any], batch_size: int):
-    for i in range(0, len(data), batch_size):
+def generate_batch(data: Sequence[str], batch_size: int):
+    for i in trange(0, len(data), batch_size):
         batch = data[i : i + batch_size]
         yield batch
+
+
+def prepare_tokenizer(tokenizer_name_or_path: str, device: torch.device) -> tuple[Callable[[Sequence[str]], torch.Tensor], int]:
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
+    tokenizer_fn = lambda s: tokenizer(s, return_tensors="pt", padding=True).input_ids.to(device=device)
+    return tokenizer_fn, tokenizer.vocab_size
 
 
 class BM25:
     def __init__(
         self,
         device_id: int | None = None,
-        tokenizer_name_or_path: str | None = None,
+        tokenizer_name_or_path: str = "bert-base-uncased",
         k1: float = 1.5,
         b: float = 0.75,
     ) -> None:
@@ -31,14 +38,11 @@ class BM25:
         self.b = b
 
         self.device = get_device(device_id)
-
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
-        self.tokenizer_fn = lambda s: tokenizer(s, return_tensors="pt", padding=True).input_ids.to(device=self.device)
-        self.vocab_size = tokenizer.vocab_size
-
-    def index(self, corpus: list[str], batch_size: int = 6) -> torch.Tensor:
-        x = []
+        self.tokenizer_fn, self.vocab_size = prepare_tokenizer(tokenizer_name_or_path, self.device)
         self.total_num_documents = 0
+
+    def index(self, corpus: Sequence[str], batch_size: int = 32) -> torch.Tensor:
+        x = []
         for batch in generate_batch(corpus, min(batch_size, len(corpus))):
             ids = self.tokenizer_fn(batch)
             num_documents, seq_length = ids.size()
@@ -53,22 +57,40 @@ class BM25:
             )
             x.append(_x)
             self.total_num_documents += num_documents
+        if hasattr(self, "vs"):
+            x.insert(0, self.vs)
         self.vs = torch.cat(x).coalesce()
         self.document_length = self.vs.sum(dim=1).to_dense()
         self.average_document_length = self.document_length.float().mean()
         return self.vs
 
+    def save_index(self, save_path: str):
+        torch.save(self.vs.to(device="cpu"), save_path)
+
+    def load_from(self, load_path: str):
+        self.vs = torch.load(load_path, map_location=self.device)
+        self.document_length = self.vs.sum(dim=1).to_dense()
+        self.average_document_length = self.document_length.float().mean()
+
     def idf(self, token_ids: torch.Tensor) -> torch.Tensor:
-        nq = (self.vs.index_select(1, token_ids.flatten()).to_dense() > 0).sum(dim=0).view(token_ids.size())
+        nq = (
+            (self.vs.index_select(1, token_ids.flatten()).to_dense() > 0)
+            .sum(dim=0)
+            .view(token_ids.size())
+        )
         return torch.where(
             nq > 0,
             torch.log((self.total_num_documents - nq + 0.5) / (nq + 0.5) + 1),
             torch.zeros_like(token_ids),
         )
 
-    def score(self, queries: str | list[str]) -> torch.Tensor:
+    def score(self, queries: Sequence[str]) -> torch.Tensor:
         token_ids = self.tokenizer_fn(queries)
-        f = self.vs.index_select(1, token_ids.flatten()).to_dense().view(self.total_num_documents, *token_ids.size())
+        f = (
+            self.vs.index_select(1, token_ids.flatten())
+            .to_dense()
+            .view(self.total_num_documents, *token_ids.size())
+        )
 
         a = f * self.k1 + 1
         b = f + self.k1 * (1 + self.b * (self.document_length.view(-1, 1, 1) - 1) / self.average_document_length)
